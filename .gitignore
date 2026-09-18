@@ -1,0 +1,11 @@
+.env
+message_cache.json
+admin_chat_id.txt
+__pycache__/
+*.pyc
+
+# not part of this project — leave untouched
+userbot.py
+my_session.session
+my_session.session-journal
+intercepted_media/
