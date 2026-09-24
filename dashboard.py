@@ -118,13 +118,20 @@ def build_summary(date_from, date_to):
                         ["ID", "RESPONSIBLE_ID", "DIRECTION", "COMPLETED", "CREATED"])
 
     task_select = ["ID", "TITLE", "STATUS", "DEADLINE", "RESPONSIBLE_ID", "CLOSED_DATE", "CREATED_DATE"]
-    tasks_open = bx.list_paged("tasks.task.list", {"filter": {"!STATUS": TASK_STATUS_DONE},
-                                                   "select": task_select}, result_key="tasks")
-    tasks_open = [t for t in tasks_open if int(t.get("status") or 0) != TASK_STATUS_DECLINED]
-    tasks_done = bx.list_paged("tasks.task.list", {
-        "filter": {"STATUS": TASK_STATUS_DONE, ">=CLOSED_DATE": t_from, "<=CLOSED_DATE": t_to},
-        "select": task_select,
-    }, result_key="tasks")
+    tasks_error = None
+    try:
+        tasks_open = bx.list_paged("tasks.task.list", {"filter": {"!STATUS": TASK_STATUS_DONE},
+                                                       "select": task_select}, result_key="tasks")
+        tasks_open = [t for t in tasks_open if int(t.get("status") or 0) != TASK_STATUS_DECLINED]
+        tasks_done = bx.list_paged("tasks.task.list", {
+            "filter": {"STATUS": TASK_STATUS_DONE, ">=CLOSED_DATE": t_from, "<=CLOSED_DATE": t_to},
+            "select": task_select,
+        }, result_key="tasks")
+    except BitrixError as e:
+        log.warning("Задачи недоступны: %s", e)
+        tasks_error = ("У вебхука нет прав на задачи — добавьте право «Задачи (task)»"
+                       if "insufficient_scope" in str(e) else f"Задачи не загрузились: {e}")
+        tasks_open, tasks_done = [], []
 
     days = days_between(date_from, date_to)
     now = datetime.now(timezone.utc)
@@ -250,6 +257,7 @@ def build_summary(date_from, date_to):
         "top_won": [{"id": d["ID"], "title": d.get("TITLE") or f"Сделка #{d['ID']}",
                      "sum": money(d["OPPORTUNITY"]), "manager": user_name(d["ASSIGNED_BY_ID"]),
                      "date": day_of(d.get("CLOSEDATE"))} for d in top_won],
+        "tasks_error": tasks_error,
         "overdue_tasks": [{"id": t["id"], "title": t.get("title"), "deadline": day_of(t.get("deadline")),
                            "responsible": user_name(t.get("responsibleId"))}
                           for t in sorted(overdue, key=lambda t: t.get("deadline") or "")[:30]],

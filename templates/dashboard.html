@@ -96,6 +96,7 @@
     <div class="card scroll"><table id="t-managers"></table></div>
 
     <div class="section-title">Задачи</div>
+    <div class="card error" id="tasks-error" hidden style="margin-bottom:12px"></div>
     <div class="grid kpis" id="kpi-tasks"></div>
     <div class="card scroll"><h2>Просроченные задачи</h2><table id="t-overdue"></table></div>
   </div>
@@ -202,6 +203,8 @@ function render() {
 
   renderManagers();
 
+  $("#tasks-error").hidden = !data.tasks_error;
+  $("#tasks-error").textContent = data.tasks_error ? "⚠️ " + data.tasks_error : "";
   $("#t-overdue").innerHTML = `<tr><th>Задача</th><th>Ответственный</th><th>Дедлайн</th></tr>` +
     (data.overdue_tasks.map(t => `<tr><td><a target="_blank" href="${esc(data.portal)}/company/personal/user/0/tasks/task/view/${esc(t.id)}/">${esc(t.title)}</a></td>
       <td>${esc(t.responsible)}</td><td class="bad">${esc(t.deadline)}</td></tr>`).join("")
