@@ -123,18 +123,31 @@ function setPreset(p) {
   document.querySelectorAll("[data-preset]").forEach(b => b.classList.toggle("active", b.dataset.preset === p));
 }
 
+let loadSeq = 0;
 async function load(refresh) {
-  $("#status").hidden = false; $("#status").className = ""; $("#status").textContent = "Загружаю данные из Битрикса…";
+  const seq = ++loadSeq;
+  const showing = !$("#content").hidden;
+  if (showing) $("#meta").textContent = "Обновляю…";
+  else { $("#status").hidden = false; $("#status").className = ""; $("#status").textContent = "Загружаю…"; }
   try {
     const q = new URLSearchParams({from: $("#from").value, to: $("#to").value});
     if (refresh) q.set("refresh", "1");
     const r = await fetch("api/summary?" + q);
     const j = await r.json();
+    if (seq !== loadSeq) return;
     if (!r.ok || j.error) throw new Error(j.error || r.statusText);
+    if (j.loading) {
+      $("#status").hidden = false; $("#content").hidden = true;
+      $("#status").textContent = "Первая загрузка из Битрикса — это один раз, дальше всё будет открываться сразу."
+        + (j.progress ? ` Сейчас: ${j.progress}` : "");
+      setTimeout(() => seq === loadSeq && load(), 2000);
+      return;
+    }
     data = j; render();
     $("#status").hidden = true; $("#content").hidden = false;
   } catch (e) {
-    $("#status").className = "error"; $("#status").textContent = "Не удалось загрузить: " + e.message;
+    if (seq !== loadSeq) return;
+    $("#status").hidden = false; $("#status").className = "error"; $("#status").textContent = "Не удалось загрузить: " + e.message;
     $("#content").hidden = true;
   }
 }
@@ -157,7 +170,7 @@ function chart(id, cfg) {
 
 function render() {
   const k = data.kpi;
-  $("#meta").textContent = `${data.period.from} — ${data.period.to} · обновлено ${data.generated_at}`;
+  $("#meta").textContent = `${data.period.from} — ${data.period.to} · данные на ${data.generated_at}`;
 
   $("#kpi-sales").innerHTML =
     kpi("Выручка", money(k.won_sum), `${k.won} выиграно`, "good") +

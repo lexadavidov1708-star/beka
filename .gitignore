@@ -9,3 +9,6 @@ userbot.py
 my_session.session
 my_session.session-journal
 intercepted_media/
+
+bitrix_data.json
+bitrix_data.json.tmp

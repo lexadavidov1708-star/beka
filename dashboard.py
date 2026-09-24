@@ -9,24 +9,24 @@ from datetime import date, datetime, timedelta, timezone
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
 
-from bitrix import Bitrix, BitrixError
+from store import Store
 
 load_dotenv()
 BITRIX_WEBHOOK_URL = os.environ.get("BITRIX_WEBHOOK_URL", "")
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
+SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "120"))
+HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "400"))
+DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("beka_dashboard")
 
 app = Flask(__name__)
 
-_cache = {}
-_cache_lock = threading.Lock()
+store = Store(os.path.join(DATA_DIR, "bitrix_data.json"), BITRIX_WEBHOOK_URL, HISTORY_DAYS)
 
 TASK_STATUS_DONE = 5
 TASK_STATUS_DECLINED = 7
-ACTIVITY_TYPE_CALL = 2
 
 
 # ---------- auth ----------
@@ -64,75 +64,32 @@ def days_between(date_from, date_to):
     return days
 
 
-def load_reference(bx):
-    statuses = bx.call("crm.status.list", {"order": {"SORT": "ASC"}}).get("result") or []
-    stage_names, stage_sort, lead_status, sources = {}, {}, {}, {}
-    for s in statuses:
-        entity = s.get("ENTITY_ID", "")
-        if entity.startswith("DEAL_STAGE"):
-            stage_names[s["STATUS_ID"]] = s["NAME"]
-            stage_sort[s["STATUS_ID"]] = int(s.get("SORT") or 0)
-        elif entity == "STATUS":
-            lead_status[s["STATUS_ID"]] = s["NAME"]
-        elif entity == "SOURCE":
-            sources[s["STATUS_ID"]] = s["NAME"]
-
-    pipelines = {"0": "Общая"}
-    try:
-        cats = bx.call("crm.category.list", {"entityTypeId": 2}).get("result", {}).get("categories", [])
-        for c in cats:
-            pipelines[str(c["id"])] = c["name"]
-    except BitrixError as e:
-        log.warning("Не удалось получить воронки: %s", e)
-
-    users = {}
-    for u in bx.list_paged("user.get", {"FILTER": {}}):
-        name = " ".join(p for p in (u.get("NAME"), u.get("LAST_NAME")) if p).strip()
-        users[str(u["ID"])] = name or u.get("EMAIL") or f"#{u['ID']}"
-
-    return stage_names, stage_sort, lead_status, sources, pipelines, users
+def in_period(value, d_from, d_to):
+    day = day_of(value)
+    return day is not None and d_from <= day <= d_to
 
 
-# ---------- data collection ----------
+# ---------- summary (built from the local copy, no Bitrix calls) ----------
 
 def build_summary(date_from, date_to):
-    bx = Bitrix(BITRIX_WEBHOOK_URL)
-    t_from = f"{date_from.isoformat()}T00:00:00"
-    t_to = f"{date_to.isoformat()}T23:59:59"
-    period = {"from": t_from, "to": t_to}
+    snap = store.snapshot()
+    ref, rows = snap["ref"], snap["rows"]
+    stage_names, stage_sort = ref.get("stage_names", {}), ref.get("stage_sort", {})
+    lead_status, sources = ref.get("lead_status", {}), ref.get("sources", {})
+    pipelines, users = ref.get("pipelines", {}), ref.get("users", {})
+    d_from, d_to = date_from.isoformat(), date_to.isoformat()
 
-    stage_names, stage_sort, lead_status, sources, pipelines, users = load_reference(bx)
-
-    deal_select = ["ID", "TITLE", "STAGE_ID", "CATEGORY_ID", "STAGE_SEMANTIC_ID", "OPPORTUNITY",
-                   "CURRENCY_ID", "ASSIGNED_BY_ID", "DATE_CREATE", "CLOSEDATE", "CLOSED"]
-    deals_new = bx.list_all("crm.deal.list", {">=DATE_CREATE": t_from, "<=DATE_CREATE": t_to}, deal_select)
-    deals_closed = bx.list_all("crm.deal.list", {"CLOSED": "Y", ">=CLOSEDATE": t_from, "<=CLOSEDATE": t_to},
-                               deal_select)
-    deals_open = bx.list_all("crm.deal.list", {"CLOSED": "N"}, deal_select)
-
-    leads = bx.list_all("crm.lead.list", {">=DATE_CREATE": t_from, "<=DATE_CREATE": t_to},
-                        ["ID", "TITLE", "STATUS_ID", "STATUS_SEMANTIC_ID", "SOURCE_ID", "ASSIGNED_BY_ID",
-                         "DATE_CREATE", "OPPORTUNITY"])
-
-    calls = bx.list_all("crm.activity.list",
-                        {"TYPE_ID": ACTIVITY_TYPE_CALL, ">=CREATED": t_from, "<=CREATED": t_to},
-                        ["ID", "RESPONSIBLE_ID", "DIRECTION", "COMPLETED", "CREATED"])
-
-    task_select = ["ID", "TITLE", "STATUS", "DEADLINE", "RESPONSIBLE_ID", "CLOSED_DATE", "CREATED_DATE"]
-    tasks_error = None
-    try:
-        tasks_open = bx.list_paged("tasks.task.list", {"filter": {"!STATUS": TASK_STATUS_DONE},
-                                                       "select": task_select}, result_key="tasks")
-        tasks_open = [t for t in tasks_open if int(t.get("status") or 0) != TASK_STATUS_DECLINED]
-        tasks_done = bx.list_paged("tasks.task.list", {
-            "filter": {"STATUS": TASK_STATUS_DONE, ">=CLOSED_DATE": t_from, "<=CLOSED_DATE": t_to},
-            "select": task_select,
-        }, result_key="tasks")
-    except BitrixError as e:
-        log.warning("Задачи недоступны: %s", e)
-        tasks_error = ("У вебхука нет прав на задачи — добавьте право «Задачи (task)»"
-                       if "insufficient_scope" in str(e) else f"Задачи не загрузились: {e}")
-        tasks_open, tasks_done = [], []
+    deals = rows["deals"]
+    deals_new = [d for d in deals if in_period(d.get("DATE_CREATE"), d_from, d_to)]
+    deals_closed = [d for d in deals if d.get("CLOSED") == "Y" and in_period(d.get("CLOSEDATE"), d_from, d_to)]
+    deals_open = [d for d in deals if d.get("CLOSED") != "Y"]
+    leads = [l for l in rows["leads"] if in_period(l.get("DATE_CREATE"), d_from, d_to)]
+    calls = [c for c in rows["calls"] if in_period(c.get("CREATED"), d_from, d_to)]
+    tasks_open = [t for t in rows["tasks"]
+                  if int(t.get("status") or 0) not in (TASK_STATUS_DONE, TASK_STATUS_DECLINED)]
+    tasks_done = [t for t in rows["tasks"]
+                  if int(t.get("status") or 0) == TASK_STATUS_DONE and in_period(t.get("closedDate"), d_from, d_to)]
+    tasks_error = snap["tasks_error"]
 
     days = days_between(date_from, date_to)
     now = datetime.now(timezone.utc)
@@ -224,7 +181,7 @@ def build_summary(date_from, date_to):
     closed_total = len(won) + len(lost)
     return {
         "period": {"from": date_from.isoformat(), "to": date_to.isoformat()},
-        "generated_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
+        "generated_at": datetime.fromtimestamp(snap["synced_at"]).strftime("%d.%m.%Y %H:%M"),
         "currency": currency,
         "portal": BITRIX_WEBHOOK_URL.split("/rest/")[0],
         "kpi": {
@@ -265,16 +222,18 @@ def build_summary(date_from, date_to):
     }
 
 
-def get_summary(date_from, date_to, refresh=False):
-    key = (date_from, date_to)
-    with _cache_lock:
-        hit = _cache.get(key)
-        if hit and not refresh and time.time() - hit[0] < CACHE_TTL:
-            return hit[1]
-    data = build_summary(date_from, date_to)
-    with _cache_lock:
-        _cache[key] = (time.time(), data)
-    return data
+def sync_loop():
+    """Keep the local copy fresh: a full download once a day, only changes in between."""
+    while True:
+        try:
+            store.sync()
+        except Exception:
+            log.exception("Синхронизация с Битриксом не удалась")
+        time.sleep(SYNC_INTERVAL)
+
+
+if BITRIX_WEBHOOK_URL:
+    threading.Thread(target=sync_loop, daemon=True).start()
 
 
 # ---------- routes ----------
@@ -304,14 +263,17 @@ def api_summary():
     if not BITRIX_WEBHOOK_URL:
         return jsonify({"error": "Не задан BITRIX_WEBHOOK_URL"}), 500
     date_from, date_to = parse_period()
-    try:
-        return jsonify(get_summary(date_from, date_to, refresh=request.args.get("refresh") == "1"))
-    except BitrixError as e:
-        log.exception("Ошибка Битрикса")
-        return jsonify({"error": str(e)}), 502
-    except Exception as e:
-        log.exception("Ошибка загрузки данных")
-        return jsonify({"error": f"Ошибка загрузки данных: {e}"}), 500
+    if request.args.get("refresh") == "1" and store.ready:
+        try:
+            store.sync(wait=False)
+        except Exception as e:
+            log.exception("Ошибка Битрикса")
+            return jsonify({"error": str(e)}), 502
+    if not store.ready:
+        if store.last_error:
+            return jsonify({"error": store.last_error}), 502
+        return jsonify({"loading": True, "progress": store.progress})
+    return jsonify(build_summary(date_from, date_to))
 
 
 if __name__ == "__main__":
