@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beka Dashboard</title>
+<script src="//api.bitrix24.com/api/v1/"></script>
+<script src="chart.umd.js"></script>
+<style>
+  :root {
+    --bg: #f4f6fa; --card: #ffffff; --text: #1c2230; --muted: #6b7489; --border: #e3e7ef;
+    --accent: #2f6fed; --good: #1f9d55; --bad: #d64545; --warn: #d98a00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #11141b; --card: #1a1f2a; --text: #e6e9f0; --muted: #8f98ab; --border: #2a3140;
+      --accent: #5b8ff9; --good: #3cc47c; --bad: #f06a6a; --warn: #f2b134;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+           padding: 16px; max-width: 1400px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 12px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  button, input { font: inherit; color: var(--text); background: var(--card); border: 1px solid var(--border);
+                  border-radius: 8px; padding: 6px 10px; }
+  button { cursor: pointer; }
+  button.active, button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  main { max-width: 1400px; margin: 0 auto; padding: 0 16px 40px; }
+  .grid { display: grid; gap: 12px; margin-bottom: 12px; }
+  .kpis { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+  .two { grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+  @media (max-width: 520px) { .two { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; min-width: 0; }
+  .kpi .v { font-size: 22px; font-weight: 600; margin-top: 4px; }
+  .kpi .s { font-size: 12px; color: var(--muted); }
+  .good { color: var(--good); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  .chart { position: relative; height: 260px; }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; cursor: pointer; user-select: none; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  a { color: var(--accent); text-decoration: none; }
+  .bar { height: 6px; background: var(--accent); border-radius: 3px; opacity: .8; }
+  .stage-row { display: grid; grid-template-columns: minmax(120px, 1.2fr) 2fr 60px 110px; gap: 8px;
+               align-items: center; padding: 4px 0; font-size: 13px; }
+  .stage-row span:nth-child(n+3) { text-align: right; font-variant-numeric: tabular-nums; }
+  #status { padding: 40px; text-align: center; }
+  .error { color: var(--bad); white-space: pre-wrap; }
+  .section-title { margin: 22px 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>📊 Beka · Битрикс24</h1>
+    <div class="muted" id="meta">&nbsp;</div>
+  </div>
+  <div class="controls">
+    <button data-preset="today">Сегодня</button>
+    <button data-preset="week">7 дней</button>
+    <button data-preset="month" class="active">Этот месяц</button>
+    <button data-preset="prev">Прошлый месяц</button>
+    <button data-preset="quarter">Квартал</button>
+    <input type="date" id="from"> — <input type="date" id="to">
+    <button class="primary" id="apply">Показать</button>
+    <button id="refresh" title="Подтянуть изменения из Битрикса">⟳</button>
+  </div>
+</header>
+<main>
+  <div id="status">Загружаю данные из Битрикса…</div>
+  <div id="content" hidden>
+    <div class="section-title">Продажи</div>
+    <div class="grid kpis" id="kpi-sales"></div>
+    <div class="grid two">
+      <div class="card"><h2>Выручка по дням (выигранные сделки)</h2><div class="chart"><canvas id="c-revenue"></canvas></div></div>
+      <div class="card"><h2>Новые сделки и лиды по дням</h2><div class="chart"><canvas id="c-flow"></canvas></div></div>
+    </div>
+    <div class="grid two">
+      <div class="card"><h2>Воронка: открытые сделки сейчас</h2><div id="funnels"></div></div>
+      <div class="card scroll"><h2>Топ-10 выигранных сделок</h2><table id="t-top"></table></div>
+    </div>
+
+    <div class="section-title">Лиды</div>
+    <div class="grid kpis" id="kpi-leads"></div>
+    <div class="grid two">
+      <div class="card"><h2>Источники лидов</h2><div class="chart"><canvas id="c-sources"></canvas></div></div>
+      <div class="card"><h2>Статусы лидов</h2><div class="chart"><canvas id="c-lstatus"></canvas></div></div>
+    </div>
+
+    <div class="section-title">Менеджеры</div>
+    <div class="card scroll"><table id="t-managers"></table></div>
+
+    <div class="section-title">Задачи</div>
+    <div class="card error" id="tasks-error" hidden style="margin-bottom:12px"></div>
+    <div class="grid kpis" id="kpi-tasks"></div>
+    <div class="card scroll"><h2>Просроченные задачи</h2><table id="t-overdue"></table></div>
+  </div>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
