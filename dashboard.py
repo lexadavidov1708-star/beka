@@ -36,7 +36,8 @@ def require_password():
     if not DASHBOARD_PASSWORD:
         return Response("Задайте DASHBOARD_PASSWORD в переменных окружения.", 503)
     auth = request.authorization
-    if auth and auth.password and hmac.compare_digest(auth.password, DASHBOARD_PASSWORD):
+    if auth and auth.password and hmac.compare_digest(auth.password.encode("utf-8"),
+                                                      DASHBOARD_PASSWORD.encode("utf-8")):
         return None
     return Response("Нужен пароль", 401, {"WWW-Authenticate": 'Basic realm="Beka Dashboard"'})
 
