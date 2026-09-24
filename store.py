@@ -181,7 +181,7 @@ class Store:
 
 
 def load_reference(bx):
-    statuses = bx.call("crm.status.list", {"order": {"SORT": "ASC"}}).get("result") or []
+    statuses = bx.list_paged("crm.status.list", {"order": {"SORT": "ASC"}})
     ref = {"stage_names": {}, "stage_sort": {}, "lead_status": {}, "sources": {}, "pipelines": {"0": "Общая"},
            "users": {}}
     for s in statuses:

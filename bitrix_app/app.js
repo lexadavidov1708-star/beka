@@ -84,7 +84,7 @@ const ENTITIES = {
     extraFilter: {"!STATUS": 5}},  // old tasks that are still open
 };
 
-const STORE_VERSION = 2;  // bump when the stored fields change, forces a full reload
+const STORE_VERSION = 4;  // bump when the stored fields change, forces a full reload
 const emptyStore = () => ({version: STORE_VERSION, ref: {}, rows: {deals: {}, leads: {}, calls: {}, tasks: {}}, cursors: {},
                            tasksError: null, fullSyncAt: 0, syncedAt: 0});
 let store = emptyStore();
@@ -113,9 +113,11 @@ async function saveStore() {
 
 async function loadReference() {
   const ref = {stage_names: {}, stage_sort: {}, lead_status: {}, sources: {}, pipelines: {"0": "Общая"}, users: {}};
-  const statuses = (await callMethod("crm.status.list", {order: {SORT: "ASC"}})).data() || [];
+  const statuses = await listAll("crm.status.list", {order: {SORT: "ASC"}});
+  const byEntity = {};
   for (const s of statuses) {
     const entity = s.ENTITY_ID || "";
+    (byEntity[entity] = byEntity[entity] || {})[s.STATUS_ID] = s.NAME;
     if (entity.startsWith("DEAL_STAGE")) { ref.stage_names[s.STATUS_ID] = s.NAME; ref.stage_sort[s.STATUS_ID] = Number(s.SORT || 0); }
     else if (entity === "STATUS") ref.lead_status[s.STATUS_ID] = s.NAME;
     else if (entity === "SOURCE") ref.sources[s.STATUS_ID] = s.NAME;
@@ -124,17 +126,23 @@ async function loadReference() {
     const cats = ((await callMethod("crm.category.list", {entityTypeId: 2})).data() || {}).categories || [];
     for (const c of cats) ref.pipelines[String(c.id)] = c.name;
   } catch (e) { console.warn("Воронки недоступны", e); }
-  // A custom field named "Проект" on deals/leads (e.g. PowerGYM) drives the project filter.
-  ref.project = {};
+  // Every list-like field of deals/leads can serve as "Проект"; which one is picked later from the data.
+  ref.candidates = {deals: [], leads: []};
+  const SKIP = new Set(["STAGE_ID", "STATUS_ID", "SOURCE_ID", "CURRENCY_ID", "CATEGORY_ID", "STATUS_SEMANTIC_ID",
+                        "STAGE_SEMANTIC_ID", "HONORIFIC"]);
   for (const [name, method] of [["deals", "crm.deal.fields"], ["leads", "crm.lead.fields"]]) {
     try {
       const fields = (await callMethod(method, {})).data() || {};
       for (const [code, f] of Object.entries(fields)) {
-        const label = f.listLabel || f.formLabel || f.filterLabel || f.title || "";
-        if (/проект|project/i.test(label)) {
-          ref.project[name] = {code, label, items: Object.fromEntries((f.items || []).map(i => [String(i.ID), i.VALUE]))};
-          break;
-        }
+        if (SKIP.has(code)) continue;
+        const custom = code.startsWith("UF_");
+        let items = null;
+        if (f.type === "enumeration") items = Object.fromEntries((f.items || []).map(i => [String(i.ID), i.VALUE]));
+        else if (f.type === "crm_status") items = byEntity[f.statusType || (f.settings || {}).ENTITY_TYPE] || {};
+        else if (!(custom && ["string", "iblock_element", "iblock_section", "crm_category"].includes(f.type))) continue;
+        if (!custom && f.type !== "crm_status") continue;
+        const label = f.listLabel || f.formLabel || f.filterLabel || f.title || code;
+        ref.candidates[name].push({code, label, type: f.type, items: items || {}});
       }
     } catch (e) { console.warn("Поля недоступны", method, e); }
   }
@@ -156,7 +164,7 @@ async function doSync(onProgress) {
 
   onProgress && onProgress("справочники");
   const ref = await loadReference();
-  const projectCodes = r => JSON.stringify(Object.values((r && r.project) || {}).map(p => p.code));
+  const projectCodes = r => JSON.stringify(((r && r.candidates) || {}).deals || []) + JSON.stringify(((r && r.candidates) || {}).leads || []);
   const full = store.version !== STORE_VERSION || Date.now() - store.fullSyncAt > FULL_SYNC_EVERY
     || projectCodes(ref) !== projectCodes(store.ref);
   const next = full ? emptyStore() : {...store, rows: {...store.rows}, cursors: {...store.cursors}};
@@ -169,7 +177,7 @@ async function doSync(onProgress) {
     let rows = [];
     try {
       for (const filter of filters) {
-        const select = ref.project[name] ? [...spec.select, ref.project[name].code] : spec.select;
+        const select = [...spec.select, ...((ref.candidates || {})[name] || []).map(c => c.code)];
         rows = rows.concat(await listAll(spec.method, {order: {ID: "ASC"}, filter, select}, spec.resultKey,
           (done, total) => onProgress && onProgress(`${spec.label}: ${done} из ${total}`)));
       }
@@ -200,36 +208,90 @@ const NONE = "Не указан";
 const FILTER_KEY = "beka-filters";
 let filters = {project: null, source: null, operator: null};  // null = all; otherwise array of values
 
-function projectApplies(name) {
-  return !!(store.ref.project || {})[name] || (name === "deals" && !(store.ref.project || {}).deals && !(store.ref.project || {}).leads);
-}
-function projectOf(name, row) {
-  const pf = (store.ref.project || {})[name];
-  if (!pf) return [(store.ref.pipelines || {})[String(row.CATEGORY_ID || "0")] || NONE];  // fallback: pipeline
-  let v = row[pf.code];
+const PIPELINE = "CATEGORY_ID";
+const isPG = v => /power\s*gym/i.test(String(v || ""));
+
+function fieldValues(name, code, row) {
+  if (code === PIPELINE) return [(store.ref.pipelines || {})[String(row.CATEGORY_ID || "0")] || NONE];
+  const c = candidatesOf(name).find(c => c.code === code);
+  let v = row[code];
   v = (Array.isArray(v) ? v : [v]).filter(x => x !== null && x !== undefined && x !== "" && x !== false);
-  return v.length ? v.map(x => pf.items[String(x)] || String(x)) : [NONE];
+  return v.length ? v.map(x => (c && c.items[String(x)]) || String(x)) : [NONE];
 }
-const sourceOf = row => (store.ref.sources || {})[row.SOURCE_ID] || row.SOURCE_ID || NONE;
-const projectLabel = () => { const p = store.ref.project || {}; return (p.deals || p.leads) ? "Проект" : "Воронка"; };
+
+function candidatesOf(name) {
+  const ref = store.ref;
+  const virtual = [{code: "SOURCE_ID", label: "Источник", items: ref.sources || {}}];
+  if (name === "deals") virtual.push({code: PIPELINE, label: "Воронка", items: ref.pipelines || {}});
+  return virtual.concat((ref.candidates || {})[name] || []);
+}
+
+// Which field drives the "project" and "source" filters: chosen by hand (⚙) or guessed.
+function pickFields(key) {
+  const rows = name => Object.values(store.rows[name] || {});
+  const hasPG = (name, c) => Object.values(c.items).some(isPG) || rows(name).some(r => fieldValues(name, c.code, r).some(isPG));
+  const guess = name => {
+    const list = candidatesOf(name);
+    if (key === "source") return "SOURCE_ID";
+    return (list.find(c => c.code !== "SOURCE_ID" && hasPG(name, c))
+      || list.find(c => /^\s*проект\s*$/i.test(c.label))
+      || list.find(c => /проект|project/i.test(c.label))
+      || {code: name === "deals" ? PIPELINE : null}).code;
+  };
+  const chosen = (filters.fields || {})[key];
+  const deals = chosen && candidatesOf("deals").some(c => c.code === chosen) ? chosen : guess("deals");
+  const dealField = candidatesOf("deals").find(c => c.code === deals);
+  const label = dealField ? dealField.label : (key === "source" ? "Источник" : "Проект");
+  // Leads: the lead field with the same code or name, else a guess.
+  const leadList = candidatesOf("leads");
+  const leads = (leadList.find(c => c.code === deals) || leadList.find(c => c.label === label) || {}).code
+    || (key === "project" ? guess("leads") : "SOURCE_ID");
+  return {deals, leads, label};
+}
+
+let pf = {deals: PIPELINE, leads: null, label: "Проект"};
+let sf = {deals: "SOURCE_ID", leads: "SOURCE_ID", label: "Источник"};
+const projectOf = (name, row) => fieldValues(name, pf[name], row);
+const sourceOf = (name, row) => sf[name] ? fieldValues(name, sf[name], row) : [NONE];
+const projectApplies = name => !!pf[name];
+
+function matchesProjectAndSource(name, row, f) {
+  return (!f.project || !projectApplies(name) || projectOf(name, row).some(p => f.project.has(p)))
+    && (!f.source || !sf[name] || sourceOf(name, row).some(v => f.source.has(v)));
+}
 
 function filterOptions() {
   const rows = name => Object.values(store.rows[name] || {});
-  const projects = new Set(), sources = new Set(Object.values(store.ref.sources || {})), operators = new Set();
+  const projects = new Set(), sources = new Set(), operators = new Set();
+  const f = activeFilters(true);
   for (const name of ["deals", "leads"]) {
-    const pf = (store.ref.project || {})[name];
-    if (pf) Object.values(pf.items).forEach(v => projects.add(v));
-    if (projectApplies(name)) rows(name).forEach(r => projectOf(name, r).forEach(p => projects.add(p)));
-    rows(name).forEach(r => { sources.add(sourceOf(r)); operators.add(String(r.ASSIGNED_BY_ID)); });
+    if (projectApplies(name)) {
+      const c = candidatesOf(name).find(c => c.code === pf[name]);
+      if (c) Object.values(c.items).forEach(v => projects.add(v));
+      rows(name).forEach(r => projectOf(name, r).forEach(p => projects.add(p)));
+    }
+    if (sf[name]) {
+      const c = candidatesOf(name).find(c => c.code === sf[name]);
+      if (c) Object.values(c.items).forEach(v => sources.add(v));
+    }
+    rows(name).forEach(r => {
+      sourceOf(name, r).forEach(v => sources.add(v));
+      // Only operators who work the selected project(s).
+      if (!(f.project && !projectApplies(name)) && matchesProjectAndSource(name, r, f)) operators.add(String(r.ASSIGNED_BY_ID));
+    });
   }
-  rows("calls").forEach(r => operators.add(String(r.RESPONSIBLE_ID)));
-  rows("tasks").forEach(r => operators.add(String(r.responsibleId)));
+  if (!f.project && !f.source) {
+    rows("calls").forEach(r => operators.add(String(r.RESPONSIBLE_ID)));
+    rows("tasks").forEach(r => operators.add(String(r.responsibleId)));
+  }
+  (filters.operator || []).forEach(id => operators.add(id));
   const users = store.ref.users || {};
   const byName = (a, b) => a.label.localeCompare(b.label, "ru");
   return {
     project: [...projects].map(v => ({value: v, label: v})).sort(byName),
     source: [...sources].map(v => ({value: v, label: v})).sort(byName),
-    operator: [...operators].filter(id => id && id !== "undefined").map(id => ({value: id, label: users[id] || "#" + id})).sort(byName),
+    operator: [...operators].filter(id => id && id !== "undefined" && id !== "null")
+      .map(id => ({value: id, label: users[id] || "#" + id})).sort(byName),
   };
 }
 
@@ -239,19 +301,35 @@ function loadFilters() {
 function saveFilters() {
   try { localStorage.setItem(FILTER_KEY, JSON.stringify(filters)); } catch (e) {}
 }
-function activeFilters() {
+function activeFilters(withoutOperatorScope) {
   const toSet = v => v ? new Set(v) : null;
-  return {project: toSet(filters.project), source: toSet(filters.source), operator: toSet(filters.operator)};
+  const f = {project: toSet(filters.project), source: toSet(filters.source), operator: toSet(filters.operator)};
+  // With a project/source picked and "all operators", calls and tasks follow that project's operators.
+  if (!withoutOperatorScope && !f.operator && (f.project || f.source)) {
+    f.operator = new Set();
+    for (const name of ["deals", "leads"]) {
+      if (f.project && !projectApplies(name)) continue;  // entity without a project field can't define the team
+      for (const r of Object.values(store.rows[name] || {})) {
+        if (matchesProjectAndSource(name, r, f)) f.operator.add(String(r.ASSIGNED_BY_ID));
+      }
+    }
+  }
+  return f;
 }
 
 function renderFilters() {
-  const opts = filterOptions();
+  pf = pickFields("project");
+  sf = pickFields("source");
+  let opts = filterOptions();
   // First run: preselect PowerGYM if such a project exists.
   if (filters.project === null && !filters.projectTouched) {
-    const pg = opts.project.find(o => /power\s*gym/i.test(o.label));
-    if (pg) filters.project = [pg.value];
+    const pg = opts.project.find(o => isPG(o.label));
+    if (pg) { filters.project = [pg.value]; opts = filterOptions(); }
   }
-  const defs = [["project", projectLabel()], ["operator", "Операторы"], ["source", "Источники"]];
+  const defs = [["project", pf.label], ["operator", "Операторы"], ["source", sf.label]];
+  const chooser = (key, current) => `<label class="dd-field">⚙ Поле:
+      <select data-field="${key}">${candidatesOf("deals").map(c =>
+        `<option value="${esc(c.code)}" ${c.code === current ? "selected" : ""}>${esc(c.label)}</option>`).join("")}</select></label>`;
   const box = $("#filters");
   const open = box.querySelector(".dd-panel:not([hidden])");
   const openKey = open && open.parentElement.dataset.key;
@@ -261,17 +339,26 @@ function renderFilters() {
     return `<div class="dd" data-key="${key}">
       <button class="dd-btn${sel ? " on" : ""}">${esc(label)}: <b>${esc(summary)}</b> ▾</button>
       <div class="dd-panel" ${key === openKey ? "" : "hidden"}>
+        ${key === "project" ? chooser(key, pf.deals) : key === "source" ? chooser(key, sf.deals) : ""}
         ${opts[key].length > 8 ? `<input class="dd-search" placeholder="Поиск…">` : ""}
         <label class="dd-all"><input type="checkbox" data-all ${sel ? "" : "checked"}> Все</label>
         <div class="dd-list">${opts[key].map(o => `<label><input type="checkbox" value="${esc(o.value)}" ${!sel || sel.includes(o.value) ? "checked" : ""}> ${esc(o.label)}</label>`).join("")}</div>
       </div></div>`;
-  }).join("") + `<span class="muted">Проект и источник фильтруют сделки и лиды, операторы — всё.</span>`;
+  }).join("") + `<span class="muted">Проект и источник фильтруют сделки и лиды; звонки и задачи — по операторам проекта.</span>`;
 }
 
 function onFilterChange(e) {
   const dd = e.target.closest(".dd");
   if (!dd) return;
   const key = dd.dataset.key;
+  if (e.target.matches("[data-field]")) {
+    filters.fields = {...(filters.fields || {}), [key]: e.target.value};
+    filters[key] = null;
+    if (key === "project") filters.projectTouched = false;
+    saveFilters();
+    show();
+    return;
+  }
   if (e.target.matches("[data-all]")) {
     filters[key] = e.target.checked ? null : [];
   } else if (e.target.matches(".dd-list input")) {
@@ -317,9 +404,7 @@ function summarize(dFrom, dTo) {
   const f = activeFilters();
   const keep = (name, row, operatorKey) =>
     (!f.operator || f.operator.has(String(row[operatorKey])))
-    && (name !== "deals" && name !== "leads" || (
-      (!f.project || !projectApplies(name) || projectOf(name, row).some(p => f.project.has(p)))
-      && (!f.source || f.source.has(sourceOf(row)))));
+    && (name !== "deals" && name !== "leads" || matchesProjectAndSource(name, row, f));
   const operatorKeys = {deals: "ASSIGNED_BY_ID", leads: "ASSIGNED_BY_ID", calls: "RESPONSIBLE_ID", tasks: "responsibleId"};
   const all = name => Object.values(store.rows[name]).filter(r => keep(name, r, operatorKeys[name]));
 
@@ -400,7 +485,7 @@ function summarize(dFrom, dTo) {
     },
     funnels,
     leads_by_status: sortedPairs(countBy(leads, l => leadStatus[l.STATUS_ID] || l.STATUS_ID || "—")),
-    leads_by_source: sortedPairs(countBy(leads, l => sources[l.SOURCE_ID] || l.SOURCE_ID || "Не указан")),
+    leads_by_source: sortedPairs(countBy(leads, l => sourceOf("leads", l)[0])),
     managers,
     top_won: [...won].sort((a, b) => num(b.OPPORTUNITY) - num(a.OPPORTUNITY)).slice(0, 10).map(d => ({
       id: d.ID, title: d.TITLE || "Сделка #" + d.ID, sum: num(d.OPPORTUNITY), manager: userName(d.ASSIGNED_BY_ID),
