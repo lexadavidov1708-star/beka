@@ -50,6 +50,19 @@
   .stage-row { display: grid; grid-template-columns: minmax(120px, 1.2fr) 2fr 60px 110px; gap: 8px;
                align-items: center; padding: 4px 0; font-size: 13px; }
   .stage-row span:nth-child(n+3) { text-align: right; font-variant-numeric: tabular-nums; }
+  .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .dd { position: relative; }
+  .dd-btn b { font-weight: 600; }
+  .dd-btn.on { border-color: var(--accent); color: var(--accent); }
+  .dd-panel { position: absolute; z-index: 10; top: calc(100% + 4px); left: 0; min-width: 240px; max-width: 90vw;
+              background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 8px;
+              box-shadow: 0 8px 24px rgba(0,0,0,.15); }
+  .dd-panel label { display: flex; gap: 8px; align-items: center; padding: 4px 6px; border-radius: 6px; cursor: pointer; white-space: nowrap; }
+  .dd-panel label:hover { background: var(--bg); }
+  .dd-panel label[hidden] { display: none; }
+  .dd-all { border-bottom: 1px solid var(--border); margin-bottom: 4px; font-weight: 600; }
+  .dd-list { max-height: 320px; overflow-y: auto; }
+  .dd-search { width: 100%; margin-bottom: 6px; }
   #status { padding: 40px; text-align: center; }
   .error { color: var(--bad); white-space: pre-wrap; }
   .section-title { margin: 22px 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
@@ -73,6 +86,7 @@
   </div>
 </header>
 <main>
+  <div class="filters" id="filters"></div>
   <div id="status">Загружаю данные из Битрикса…</div>
   <div id="content" hidden>
     <div class="section-title">Продажи</div>

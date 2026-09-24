@@ -68,7 +68,7 @@ async function listAll(method, params, resultKey, onProgress) {
 const ENTITIES = {
   deals: {label: "сделки", method: "crm.deal.list", id: "ID", modified: "DATE_MODIFY",
     select: ["ID", "TITLE", "STAGE_ID", "CATEGORY_ID", "STAGE_SEMANTIC_ID", "OPPORTUNITY", "CURRENCY_ID",
-             "ASSIGNED_BY_ID", "DATE_CREATE", "CLOSEDATE", "CLOSED", "DATE_MODIFY"],
+             "ASSIGNED_BY_ID", "DATE_CREATE", "CLOSEDATE", "CLOSED", "DATE_MODIFY", "SOURCE_ID"],
     filter: since => ({})},
   leads: {label: "лиды", method: "crm.lead.list", id: "ID", modified: "DATE_MODIFY",
     select: ["ID", "TITLE", "STATUS_ID", "STATUS_SEMANTIC_ID", "SOURCE_ID", "ASSIGNED_BY_ID", "DATE_CREATE",
@@ -84,7 +84,8 @@ const ENTITIES = {
     extraFilter: {"!STATUS": 5}},  // old tasks that are still open
 };
 
-const emptyStore = () => ({ref: {}, rows: {deals: {}, leads: {}, calls: {}, tasks: {}}, cursors: {},
+const STORE_VERSION = 2;  // bump when the stored fields change, forces a full reload
+const emptyStore = () => ({version: STORE_VERSION, ref: {}, rows: {deals: {}, leads: {}, calls: {}, tasks: {}}, cursors: {},
                            tasksError: null, fullSyncAt: 0, syncedAt: 0});
 let store = emptyStore();
 let storeKey = "data";
@@ -123,6 +124,20 @@ async function loadReference() {
     const cats = ((await callMethod("crm.category.list", {entityTypeId: 2})).data() || {}).categories || [];
     for (const c of cats) ref.pipelines[String(c.id)] = c.name;
   } catch (e) { console.warn("Воронки недоступны", e); }
+  // A custom field named "Проект" on deals/leads (e.g. PowerGYM) drives the project filter.
+  ref.project = {};
+  for (const [name, method] of [["deals", "crm.deal.fields"], ["leads", "crm.lead.fields"]]) {
+    try {
+      const fields = (await callMethod(method, {})).data() || {};
+      for (const [code, f] of Object.entries(fields)) {
+        const label = f.listLabel || f.formLabel || f.filterLabel || f.title || "";
+        if (/проект|project/i.test(label)) {
+          ref.project[name] = {code, label, items: Object.fromEntries((f.items || []).map(i => [String(i.ID), i.VALUE]))};
+          break;
+        }
+      }
+    } catch (e) { console.warn("Поля недоступны", method, e); }
+  }
   for (const u of await listAll("user.get", {FILTER: {}})) {
     ref.users[String(u.ID)] = [u.NAME, u.LAST_NAME].filter(Boolean).join(" ").trim() || u.EMAIL || "#" + u.ID;
   }
@@ -136,13 +151,16 @@ function sync(onProgress) {
 }
 
 async function doSync(onProgress) {
-  const full = Date.now() - store.fullSyncAt > FULL_SYNC_EVERY;
   const sinceDate = new Date(Date.now() - HISTORY_DAYS * 864e5);
   const since = iso(sinceDate) + "T00:00:00";
-  const next = full ? emptyStore() : {...store, rows: {...store.rows}, cursors: {...store.cursors}};
 
   onProgress && onProgress("справочники");
-  next.ref = await loadReference();
+  const ref = await loadReference();
+  const projectCodes = r => JSON.stringify(Object.values((r && r.project) || {}).map(p => p.code));
+  const full = store.version !== STORE_VERSION || Date.now() - store.fullSyncAt > FULL_SYNC_EVERY
+    || projectCodes(ref) !== projectCodes(store.ref);
+  const next = full ? emptyStore() : {...store, rows: {...store.rows}, cursors: {...store.cursors}};
+  next.ref = ref;
 
   for (const [name, spec] of Object.entries(ENTITIES)) {
     const cursor = full ? null : store.cursors[name];
@@ -151,7 +169,8 @@ async function doSync(onProgress) {
     let rows = [];
     try {
       for (const filter of filters) {
-        rows = rows.concat(await listAll(spec.method, {order: {ID: "ASC"}, filter, select: spec.select}, spec.resultKey,
+        const select = ref.project[name] ? [...spec.select, ref.project[name].code] : spec.select;
+        rows = rows.concat(await listAll(spec.method, {order: {ID: "ASC"}, filter, select}, spec.resultKey,
           (done, total) => onProgress && onProgress(`${spec.label}: ${done} из ${total}`)));
       }
     } catch (e) {
@@ -175,6 +194,115 @@ async function doSync(onProgress) {
   await saveStore();
 }
 
+// ---------- filters: project, operators, sources ----------
+
+const NONE = "Не указан";
+const FILTER_KEY = "beka-filters";
+let filters = {project: null, source: null, operator: null};  // null = all; otherwise array of values
+
+function projectApplies(name) {
+  return !!(store.ref.project || {})[name] || (name === "deals" && !(store.ref.project || {}).deals && !(store.ref.project || {}).leads);
+}
+function projectOf(name, row) {
+  const pf = (store.ref.project || {})[name];
+  if (!pf) return [(store.ref.pipelines || {})[String(row.CATEGORY_ID || "0")] || NONE];  // fallback: pipeline
+  let v = row[pf.code];
+  v = (Array.isArray(v) ? v : [v]).filter(x => x !== null && x !== undefined && x !== "" && x !== false);
+  return v.length ? v.map(x => pf.items[String(x)] || String(x)) : [NONE];
+}
+const sourceOf = row => (store.ref.sources || {})[row.SOURCE_ID] || row.SOURCE_ID || NONE;
+const projectLabel = () => { const p = store.ref.project || {}; return (p.deals || p.leads) ? "Проект" : "Воронка"; };
+
+function filterOptions() {
+  const rows = name => Object.values(store.rows[name] || {});
+  const projects = new Set(), sources = new Set(Object.values(store.ref.sources || {})), operators = new Set();
+  for (const name of ["deals", "leads"]) {
+    const pf = (store.ref.project || {})[name];
+    if (pf) Object.values(pf.items).forEach(v => projects.add(v));
+    if (projectApplies(name)) rows(name).forEach(r => projectOf(name, r).forEach(p => projects.add(p)));
+    rows(name).forEach(r => { sources.add(sourceOf(r)); operators.add(String(r.ASSIGNED_BY_ID)); });
+  }
+  rows("calls").forEach(r => operators.add(String(r.RESPONSIBLE_ID)));
+  rows("tasks").forEach(r => operators.add(String(r.responsibleId)));
+  const users = store.ref.users || {};
+  const byName = (a, b) => a.label.localeCompare(b.label, "ru");
+  return {
+    project: [...projects].map(v => ({value: v, label: v})).sort(byName),
+    source: [...sources].map(v => ({value: v, label: v})).sort(byName),
+    operator: [...operators].filter(id => id && id !== "undefined").map(id => ({value: id, label: users[id] || "#" + id})).sort(byName),
+  };
+}
+
+function loadFilters() {
+  try { const saved = JSON.parse(localStorage.getItem(FILTER_KEY) || "null"); if (saved) filters = {...filters, ...saved}; } catch (e) {}
+}
+function saveFilters() {
+  try { localStorage.setItem(FILTER_KEY, JSON.stringify(filters)); } catch (e) {}
+}
+function activeFilters() {
+  const toSet = v => v ? new Set(v) : null;
+  return {project: toSet(filters.project), source: toSet(filters.source), operator: toSet(filters.operator)};
+}
+
+function renderFilters() {
+  const opts = filterOptions();
+  // First run: preselect PowerGYM if such a project exists.
+  if (filters.project === null && !filters.projectTouched) {
+    const pg = opts.project.find(o => /power\s*gym/i.test(o.label));
+    if (pg) filters.project = [pg.value];
+  }
+  const defs = [["project", projectLabel()], ["operator", "Операторы"], ["source", "Источники"]];
+  const box = $("#filters");
+  const open = box.querySelector(".dd-panel:not([hidden])");
+  const openKey = open && open.parentElement.dataset.key;
+  box.innerHTML = defs.map(([key, label]) => {
+    const sel = filters[key];
+    const summary = !sel ? "все" : sel.length === 1 ? (opts[key].find(o => o.value === sel[0]) || {label: sel[0]}).label : `выбрано ${sel.length}`;
+    return `<div class="dd" data-key="${key}">
+      <button class="dd-btn${sel ? " on" : ""}">${esc(label)}: <b>${esc(summary)}</b> ▾</button>
+      <div class="dd-panel" ${key === openKey ? "" : "hidden"}>
+        ${opts[key].length > 8 ? `<input class="dd-search" placeholder="Поиск…">` : ""}
+        <label class="dd-all"><input type="checkbox" data-all ${sel ? "" : "checked"}> Все</label>
+        <div class="dd-list">${opts[key].map(o => `<label><input type="checkbox" value="${esc(o.value)}" ${!sel || sel.includes(o.value) ? "checked" : ""}> ${esc(o.label)}</label>`).join("")}</div>
+      </div></div>`;
+  }).join("") + `<span class="muted">Проект и источник фильтруют сделки и лиды, операторы — всё.</span>`;
+}
+
+function onFilterChange(e) {
+  const dd = e.target.closest(".dd");
+  if (!dd) return;
+  const key = dd.dataset.key;
+  if (e.target.matches("[data-all]")) {
+    filters[key] = e.target.checked ? null : [];
+  } else if (e.target.matches(".dd-list input")) {
+    const boxes = [...dd.querySelectorAll(".dd-list input")];
+    const checked = boxes.filter(b => b.checked).map(b => b.value);
+    filters[key] = checked.length === boxes.length ? null : checked;
+  } else return;
+  if (key === "project") filters.projectTouched = true;
+  saveFilters();
+  show();
+}
+
+function onFilterClick(e) {
+  const btn = e.target.closest(".dd-btn");
+  const panels = document.querySelectorAll(".dd-panel");
+  if (btn) {
+    const panel = btn.nextElementSibling;
+    const wasHidden = panel.hidden;
+    panels.forEach(p => p.hidden = true);
+    panel.hidden = !wasHidden;
+    return;
+  }
+  if (!e.target.closest(".dd-panel")) panels.forEach(p => p.hidden = true);
+}
+
+function onFilterSearch(e) {
+  if (!e.target.matches(".dd-search")) return;
+  const q = e.target.value.toLowerCase();
+  e.target.closest(".dd").querySelectorAll(".dd-list label").forEach(l => l.hidden = !l.textContent.toLowerCase().includes(q));
+}
+
 // ---------- summary for a period (pure, from the local copy) ----------
 
 const dayOf = v => v ? String(v).slice(0, 10) : null;
@@ -186,7 +314,14 @@ const sortedPairs = m => Object.entries(m).sort((a, b) => b[1] - a[1]);
 function summarize(dFrom, dTo) {
   const ref = store.ref, users = ref.users || {};
   const userName = id => users[String(id)] || "#" + id;
-  const all = name => Object.values(store.rows[name]);
+  const f = activeFilters();
+  const keep = (name, row, operatorKey) =>
+    (!f.operator || f.operator.has(String(row[operatorKey])))
+    && (name !== "deals" && name !== "leads" || (
+      (!f.project || !projectApplies(name) || projectOf(name, row).some(p => f.project.has(p)))
+      && (!f.source || f.source.has(sourceOf(row)))));
+  const operatorKeys = {deals: "ASSIGNED_BY_ID", leads: "ASSIGNED_BY_ID", calls: "RESPONSIBLE_ID", tasks: "responsibleId"};
+  const all = name => Object.values(store.rows[name]).filter(r => keep(name, r, operatorKeys[name]));
 
   const deals = all("deals");
   const dealsNew = deals.filter(d => inPeriod(d.DATE_CREATE, dFrom, dTo));
@@ -280,6 +415,7 @@ function summarize(dFrom, dTo) {
 
 function show() {
   if (!store.syncedAt) return;
+  renderFilters();
   data = summarize($("#from").value, $("#to").value);
   render();
   $("#status").hidden = true; $("#content").hidden = false;
@@ -411,6 +547,10 @@ document.addEventListener("click", e => {
   BX24.openPath(a.dataset.path);
 });
 setPreset("month");
+loadFilters();
+document.addEventListener("click", onFilterClick);
+document.addEventListener("change", onFilterChange);
+document.addEventListener("input", onFilterSearch);
 
 if (!window.BX24) {
   $("#status").className = "error";
